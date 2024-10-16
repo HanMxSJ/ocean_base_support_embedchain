@@ -98,6 +98,7 @@ class VectorDBFactory:
         "qdrant": "embedchain.vectordb.qdrant.QdrantDB",
         "weaviate": "embedchain.vectordb.weaviate.WeaviateDB",
         "zilliz": "embedchain.vectordb.zilliz.ZillizVectorDB",
+        "ocean_base": "embedchain.vectordb.ocean_base.OceanBaseVectorDB",
     }
     provider_to_config_class = {
         "chroma": "embedchain.config.vector_db.chroma.ChromaDbConfig",
@@ -108,8 +109,8 @@ class VectorDBFactory:
         "qdrant": "embedchain.config.vector_db.qdrant.QdrantDBConfig",
         "weaviate": "embedchain.config.vector_db.weaviate.WeaviateDBConfig",
         "zilliz": "embedchain.config.vector_db.zilliz.ZillizDBConfig",
+        "ocean_base": "embedchain.config.vector_db.ocean_base.OceanBaseDBConfig",
     }
-
     @classmethod
     def create(cls, provider_name, config_data):
         class_type = cls.provider_to_class.get(provider_name)
