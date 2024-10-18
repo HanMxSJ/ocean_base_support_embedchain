@@ -1,7 +1,9 @@
 import hashlib
 import logging
 from typing import Any, Optional
+import pymysql
 
+from embedchain.config.vector_db.ocean_base import OceanBaseDBConfig
 from embedchain.loaders.base_loader import BaseLoader
 from embedchain.utils.misc import clean_string
 
@@ -19,7 +21,8 @@ class OceanBaseLoader(BaseLoader):
             )
 
         self.config = config
-        self.connection = None
+        ob_config = OceanBaseDBConfig(config.get("user"), config.get("host"), config.get("port"), config.get("password"), config.get("database"))
+        self.connection = pymysql.connect(ob_config);
         self.cursor = None
         self._setup_loader(config=config)
 
