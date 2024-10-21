@@ -260,12 +260,13 @@ class OceanBaseDB(BaseVectorDB):
 
     def add(
             self,
-            add_documents: Optional[list[str]] = None,
+            documents: Optional[list[str]] = None,
             metadatas: Optional[list[object]] = None,
             ids: Optional[list[str]]=None,
             **kwargs: Optional[dict[str, any]],
     ) -> Any:
-        embeddings = self.embedding_function(add_documents)
+        add_documents = list(documents)
+        embeddings = self.embedder.embedding_fn(documents)
         if len(embeddings) == 0:
             return ids
 

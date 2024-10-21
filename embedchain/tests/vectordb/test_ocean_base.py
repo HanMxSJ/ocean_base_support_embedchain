@@ -55,9 +55,13 @@ def test_ocean_base_db_duplicates_throw_warning(caplog):
     db = OceanBaseDB(config=ob_config)
     app = App(embedding_model = ob_config.embedder,config=AppConfig(collect_metrics=False), db=db)
 
-    app.db.add(add_documents =  ['apple'],
-                       #metadatas = ['apple', 'banana', 'cherry', 'date'],
-                       #ids = ['123','234','345','456'],
+    documents = ["This is a document.", "This is another document."]
+    metadatas = [{"url": "url_1", "doc_id": "doc_id_1"}, {"url": "url_2", "doc_id": "doc_id_2"}]
+    ids = ["doc_1", "doc_2"]
+
+    app.db.add(documents =  documents,
+                       metadatas = metadatas,
+                       ids = ids,
             )
     #app.add(embeddings=[[0, 0, 0]], ids=["0"])
     assert "Insert of existing embedding ID: 0" in caplog.text
