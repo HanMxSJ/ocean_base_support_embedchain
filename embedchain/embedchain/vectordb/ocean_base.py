@@ -329,6 +329,7 @@ class OceanBaseDB(BaseVectorDB):
             n_results: Optional[int] = 4,
             param: Optional[dict] = None,
             where: Optional[str] = None,
+            citations: bool = False,
             **kwargs: Any,
     ) -> Union[list[tuple[str, dict]], list[str]]:
         try:
@@ -346,7 +347,7 @@ class OceanBaseDB(BaseVectorDB):
             return []
         query_vector = self.embedder.to_embeddings(input_query)
         sadf = self.similarity_search_by_vector(
-            embedding=query_vector, k=n_results, param=param, fltr=where, **kwargs
+            embedding=query_vector, k=n_results, param=param, fltr=where,citations=citations, **kwargs
         )
         return sadf
 
@@ -356,6 +357,7 @@ class OceanBaseDB(BaseVectorDB):
         k: int = 4,
         param: Optional[dict] = None,
         fltr: Optional[str] = None,
+        citations: Optional[bool] = False,
         **kwargs: Any,
     ) -> Union[list[tuple[str, dict]], list[str]]:
         """Perform a similarity search against the query string.
@@ -397,10 +399,13 @@ class OceanBaseDB(BaseVectorDB):
         # 修改返回值的格式
         results = res.fetchall()
         if results:
-            return [
-                (r[0], json.loads(r[1]))
-                for r in results
-            ]
+            if citations:
+                return [
+                    (r[0], json.loads(r[1]))
+                    for r in results
+                ]
+            else:
+                return [r[0] for r in results]
         else:
             return []  # 返回空列表
 

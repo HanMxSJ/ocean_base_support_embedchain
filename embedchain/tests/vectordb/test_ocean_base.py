@@ -46,13 +46,7 @@ class TestEsDB(unittest.TestCase):
         return App(config=app_config, db=ob)
 
 
-    @pytest.fixture(scope="session", autouse=True)
-    def cleanup_db(self):
-        yield
-        try:
-            shutil.rmtree("test-db")
-        except OSError as e:
-            print("Error: %s - %s." % (e.filename, e.strerror))
+
 
 
     def test_ocean_base_db_add_query_document(self):
