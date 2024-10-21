@@ -282,8 +282,6 @@ class OceanBaseDB(BaseVectorDB):
         if not metadatas:
             metadatas = [{} for _ in add_documents]
 
-        extra_data = add_documents or [{} for _ in add_documents]
-
         pks: list[str] = []
         for i in range(0, total_count, self.config.batch_size):
             data = [
@@ -294,14 +292,12 @@ class OceanBaseDB(BaseVectorDB):
                     ),
                     self.text_field: document,
                     self.metadata_field: metadata,
-                    **extra,
                 }
-                for index_id, embedding, document, metadata, extra in zip(
+                for index_id, embedding, document, metadata, in zip(
                     ids[i: i + self.config.batch_size],
                     embeddings[i: i + self.config.batch_size],
                     add_documents[i: i + self.config.batch_size],
                     metadatas[i: i + self.config.batch_size],
-                    extra_data[i: i + self.config.batch_size],
                 )
             ]
             try:
