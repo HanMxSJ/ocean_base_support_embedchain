@@ -27,7 +27,7 @@ class TestEsDB(unittest.TestCase):
                         model="bailing_1b_embedding",
                         api_key='lKvQac6mTlqFFKRkgfscxxt7UvsR7PbU',
                         api_base='https://antchat.alipay.com/v1',
-                        vector_dimension=100,
+                        #vector_dimension=100,
 
                     ),
                 ),
