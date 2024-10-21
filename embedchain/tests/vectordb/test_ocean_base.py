@@ -51,7 +51,7 @@ def cleanup_db():
         print("Error: %s - %s." % (e.filename, e.strerror))
 
 
-def test_ocean_base_db_duplicates_throw_warning(caplog):
+def test_ocean_base_db_add_document(caplog):
     db = OceanBaseDB(config=ob_config)
     app = App(embedding_model = ob_config.embedder,config=AppConfig(collect_metrics=False), db=db)
 
