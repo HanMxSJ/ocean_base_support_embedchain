@@ -263,6 +263,8 @@ class OceanBaseDB(BaseVectorDB):
             documents: Optional[list[str]] = None,
             metadatas: Optional[list[object]] = None,
             ids: Optional[list[str]]=None,
+            extras: Optional[List[dict]] = None,
+            partition_name: Optional[str] = None,
             **kwargs: Optional[dict[str, any]],
     ) -> Any:
         add_documents = list(documents)
@@ -282,6 +284,8 @@ class OceanBaseDB(BaseVectorDB):
         if not metadatas:
             metadatas = [{} for _ in add_documents]
 
+        extra_data = extras or [{} for _ in add_documents]
+
         pks: list[str] = []
         for i in range(0, total_count, self.config.batch_size):
             data = [
@@ -292,18 +296,22 @@ class OceanBaseDB(BaseVectorDB):
                     ),
                     self.text_field: document,
                     self.metadata_field: metadata,
+                    **extra,
                 }
-                for index_id, embedding, document, metadata, in zip(
+                for index_id, embedding, document, metadata,extra in zip(
                     ids[i: i + self.config.batch_size],
                     embeddings[i: i + self.config.batch_size],
                     add_documents[i: i + self.config.batch_size],
                     metadatas[i: i + self.config.batch_size],
+                    "",
+                    #extra_data[i: i + batch_size],
                 )
             ]
             try:
                 self.ob_vector.insert(
                     table_name=self.table_name,
                     data=data,
+                    partition_name=(partition_name or ""),
                 )
                 pks.extend(ids[i: i + self.config.batch_size])
             except Exception:
@@ -320,7 +328,7 @@ class OceanBaseDB(BaseVectorDB):
             input_query: Optional[str] = None,
             n_results: Optional[int] = 4,
             param: Optional[dict] = None,
-            fltr: Optional[str] = None,
+            where: Optional[str] = None,
             **kwargs: Any,
     ) -> Union[list[tuple[str, dict]], list[str]]:
         try:
@@ -338,9 +346,9 @@ class OceanBaseDB(BaseVectorDB):
             return []
         query_vector = self.embedder.to_embeddings(input_query)
         sadf = self.similarity_search_by_vector(
-            embedding=query_vector, k=n_results, param=param, fltr=fltr, **kwargs
+            embedding=query_vector, k=n_results, param=param, fltr=where, **kwargs
         )
-        return None
+        return sadf
 
     def similarity_search_by_vector(
         self,
@@ -349,7 +357,7 @@ class OceanBaseDB(BaseVectorDB):
         param: Optional[dict] = None,
         fltr: Optional[str] = None,
         **kwargs: Any,
-    ) -> List[Document]:
+    ) -> Union[list[tuple[str, dict]], list[str]]:
         """Perform a similarity search against the query string.
 
         Args:
@@ -386,13 +394,15 @@ class OceanBaseDB(BaseVectorDB):
             where_clause=([text(fltr)] if fltr is not None else None),
             **kwargs,
         )
-        return [
-            Document(
-                page_content=r[0],
-                metadata=json.loads(r[1]),
-            )
-            for r in res.fetchall()
-        ]
+        # 修改返回值的格式
+        results = res.fetchall()
+        if results:
+            return [
+                (r[0], json.loads(r[1]))
+                for r in results
+            ]
+        else:
+            return []  # 返回空列表
 
     def _parse_metric_type_str_to_dist_func(self) -> Any:
         if self.vidx_metric_type == "l2":
@@ -410,18 +420,20 @@ class OceanBaseDB(BaseVectorDB):
         :return: number of documents
         :rtype: int
         """
-        res = self.ob_vector.get(
-            table_name=self.table_name,
-        )
-        return res.rowcount()
+        if self.collection.check_table_exists(table_name=self.table_name):
+            res = self.ob_vector.get(
+                table_name=self.table_name,
+            )
+            return res.rowcount()
+        else:
+            return 0
 
     def reset(self):
         """
         Resets the database. Deletes all embeddings irreversibly.
         """
-        if self.client.indices.exists(index=self.config.collection_name):
-            # delete index in ocean_base
-            self.client.indices.delete(index=self.config.collection_name)
+        if self.collection.check_table_exists(table_name=self.table_name):
+            self.collection.drop_table_if_exist(table_name=self.table_name)
 
     def set_collection_name(self, name: str):
         """
