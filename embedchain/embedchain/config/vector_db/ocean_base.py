@@ -13,11 +13,12 @@ class OceanBaseDBConfig(BaseVectorDbConfig):
         host: Optional[str] = None,
         port: Optional[int] = None,
         password: Optional[str] = None,
-        database: Optional[str] = None,
+        db_name: Optional[str] = None, #就是table name
         batch_size: Optional[int] = 100,
         charset: Optional[str] = 'utf8mb4',
         allow_reset=False,
-        embedder:Optional[BaseEmbedder] = None
+        embedder:Optional[BaseEmbedder] = None,
+        collection_name:Optional[str] = None,
     ):
         self.user = user
         self.host = host
@@ -28,4 +29,5 @@ class OceanBaseDBConfig(BaseVectorDbConfig):
         self.allow_reset = allow_reset
         self.batch_size = batch_size
         self.embedder = embedder
-        self.database = database
+        self.db_name = db_name
+        super().__init__(collection_name=collection_name, host=host, port=port)

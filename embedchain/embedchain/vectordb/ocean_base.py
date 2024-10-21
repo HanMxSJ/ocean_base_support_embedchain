@@ -1,11 +1,19 @@
 import logging
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Type, Union
-
-import pymysql
+from sqlalchemy import JSON, Column, String, Table, func, text
+import traceback
 import uuid
 import json
 import threading
+import numpy as np
 
+try:
+    from pyobvector import ObVecClient
+except ImportError:
+    raise ImportError(
+        "Could not import pyobvector package. "
+        "Please install it with `pip install pyobvector`."
+    )
 from langchain_core.documents import Document
 from nltk.corpus.reader import documents
 from sqlalchemy.types import UserDefinedType, Float, String
@@ -22,163 +30,125 @@ from embedchain.config.vector_db.ocean_base import OceanBaseDBConfig
 
 from tqdm import tqdm
 
-_EMBEDCHAIN_OCEANBASE_DEFAULT_EMBEDDING_DIM = 1536
-_EMBEDCHAIN_OCEANBASE_DEFAULT_COLLECTION_NAME = "embedchain_document"
-_EMBEDCHAIN_OCEANBASE_DEFAULT_IVFFLAT_CREATION_ROW_THRESHOLD = 10000
-_EMBEDCHAIN_OCEANBASE_DEFAULT_RWLOCK_MAX_READER = 64
+DEFAULT_OCEAN_BASE_VECTOR_TABLE_NAME = "embedchain_vector"
+DEFAULT_OCEAN_BASE_HNSW_BUILD_PARAM = {"M": 16, "efConstruction": 256}
+DEFAULT_OCEAN_BASE_HNSW_SEARCH_PARAM = {"efSearch": 64}
+OCEAN_BASE_SUPPORTED_VECTOR_INDEX_TYPE = "HNSW"
+DEFAULT_OCEAN_BASE_VECTOR_METRIC_TYPE = "l2"
+
+DEFAULT_METADATA_FIELD = "metadata"
 
 logger = logging.getLogger(__name__)
 
 
-Base = declarative_base()
-
-def from_db(value):
-    return [float(v) for v in value[1:-1].split(',')]
-
-def to_db(value, dim=None):
-    if value is None:
-        return value
-
-    return '[' + ','.join([str(float(v)) for v in value]) + ']'
-
-
-class Vector(UserDefinedType):
-    cache_ok = True
-    _string = String()
-
-    def __init__(self, dim):
-        super(UserDefinedType, self).__init__()
-        self.dim = dim
-
-    def get_col_spec(self, **kw):
-        return "VECTOR(%d)" % self.dim
-
-    def bind_processor(self, dialect):
-        def process(value):
-            return to_db(value, self.dim)
-        return process
-
-    def literal_processor(self, dialect):
-        string_literal_processor = self._string._cached_literal_processor(dialect)
-
-        def process(value):
-            return string_literal_processor(to_db(value, self.dim))
-        return process
-
-    def result_processor(self, dialect, coltype):
-        def process(value):
-            return from_db(value)
-        return process
-
-    class comparator_factory(UserDefinedType.Comparator):
-        def l2_distance(self, other):
-            return self.op('<->', return_type=Float)(other)
-
-        def max_inner_product(self, other):
-            return self.op('<#>', return_type=Float)(other)
-
-        def cosine_distance(self, other):
-            return self.op('<=>', return_type=Float)(other)
-
-
-class OceanBaseGlobalRWLock:
-    def __init__(self, max_readers) -> None:
-        self.max_readers_ = max_readers
-        self.writer_entered_ = False
-        self.reader_cnt_ = 0
-        self.mutex_ = threading.Lock()
-        self.writer_cv_ = threading.Condition(self.mutex_)
-        self.reader_cv_ = threading.Condition(self.mutex_)
-
-    def rlock(self):
-        self.mutex_.acquire()
-        while self.writer_entered_ or self.max_readers_ == self.reader_cnt_:
-            self.reader_cv_.wait()
-        self.reader_cnt_ += 1
-        self.mutex_.release()
-
-    def runlock(self):
-        self.mutex_.acquire()
-        self.reader_cnt_ -= 1
-        if self.writer_entered_:
-            if 0 == self.reader_cnt_:
-                self.writer_cv_.notify(1)
-        else:
-            if self.max_readers_ - 1 == self.reader_cnt_:
-                self.reader_cv_.notify(1)
-        self.mutex_.release()
-
-    def wlock(self):
-        self.mutex_.acquire()
-        while self.writer_entered_:
-            self.reader_cv_.wait()
-        self.writer_entered_ = True
-        while 0 < self.reader_cnt_:
-            self.writer_cv_.wait()
-        self.mutex_.release()
-
-    def wunlock(self):
-        self.mutex_.acquire()
-        self.writer_entered_ = False
-        self.reader_cv_.notifyAll()
-        self.mutex_.release()
-
-    class OBRLock:
-        def __init__(self, rwlock) -> None:
-            self.rwlock_ = rwlock
-
-        def __enter__(self):
-            self.rwlock_.rlock()
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            self.rwlock_.runlock()
-
-    class OBWLock:
-        def __init__(self, rwlock) -> None:
-            self.rwlock_ = rwlock
-
-        def __enter__(self):
-            self.rwlock_.wlock()
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            self.rwlock_.wunlock()
-
-    def reader_lock(self):
-        return self.OBRLock(self)
-
-    def writer_lock(self):
-        return self.OBWLock(self)
-
-
-ob_grwlock = OceanBaseGlobalRWLock(_EMBEDCHAIN_OCEANBASE_DEFAULT_RWLOCK_MAX_READER)
 
 @register_deserializable
 class OceanBaseDB(BaseVectorDB):
     """Vector database using OceanBaseDB."""
 
-    def __init__(self, config: Optional[OceanBaseDBConfig] = None):
+    def __init__(self,
+                 config: Optional[OceanBaseDBConfig] = None, #连接配置
+                 table_name: str = DEFAULT_OCEAN_BASE_VECTOR_TABLE_NAME, #表名
+                 vidx_metric_type: str = DEFAULT_OCEAN_BASE_VECTOR_METRIC_TYPE,
+                 vidx_algo_params: Optional[dict] = None,
+                 drop_old: bool = False,
+                 primary_field: str = "id",
+                 vector_field: str = "embedding",
+                 text_field: str = "document",
+                 metadata_field: Optional[str] = DEFAULT_METADATA_FIELD,
+                 vidx_name: str = "vidx",
+                 partitions: Optional[Any] = None,
+                 extra_columns: Optional[List[Column]] = None,
+                 normalize: bool = False,
+                 **kwargs,
+                 ):
         """Initialize a new OceanBaseDB instance
-
-        :param config: Configuration options for OceanBaseDB, defaults to None
-        :type config: Optional[OceanBaseDbConfig], optional
         """
-        if config:
-            self.config = config
-        else:
-            self.config = OceanBaseDBConfig()
+        self.config = config
+        self.table_name = table_name
+        self.connection_args = config
+        self.extra_columns = extra_columns
+        self.normalize = normalize
+        self._create_client(**kwargs)
+        assert self.ob_vector is not None
 
-        # 将config中的内容直接传递给pymysql.connect()
-        self.conn = pymysql.connect(
-            host=self.config.host,
-            port=self.config.port,
-            user=self.config.user,
-            password=self.config.password,
-            database=self.config.database,
-            charset=self.config.charset
+        self.vidx_metric_type = vidx_metric_type.lower()
+        if self.vidx_metric_type not in ("l2", "inner_product"):
+            raise ValueError(
+                "`vidx_metric_type` should be set in `l2`/`inner_product`."
+            )
+
+        self.vidx_algo_params = (
+            vidx_algo_params
+            if vidx_algo_params is not None
+            else DEFAULT_OCEAN_BASE_HNSW_BUILD_PARAM
         )
+
+        self.drop_old = drop_old
+        self.primary_field = primary_field
+        self.vector_field = vector_field
+        self.text_field = text_field
+        self.metadata_field = metadata_field or DEFAULT_METADATA_FIELD
+        self.vidx_name = vidx_name
+        self.partition = partitions
+        self.hnsw_ef_search = -1
 
         # Remove auth credentials from config after successful connection
         super().__init__(config=self.config)
+        self.embedding_function = config.embedder.embedding_fn
+
+
+    def _create_client(self, **kwargs):  # type: ignore[no-untyped-def]
+        try:
+            from pyobvector import ObVecClient
+        except ImportError:
+            raise ImportError(
+                "Could not import pyobvector package. "
+                "Please install it with `pip install pyobvector`."
+            )
+
+        host = self.connection_args.host
+        port = self.connection_args.port
+        user = self.connection_args.user
+        password = self.connection_args.password
+        db_name = self.connection_args.db_name
+
+        self.ob_vector = ObVecClient(
+            uri=host + ":" + str(port),
+            user=user,
+            password=password,
+            db_name=db_name,
+            **kwargs,
+        )
+        self.collection = self.ob_vector
+
+    def _normalize_str(self, vector: str) -> List[str]:
+        arr = np.array(vector)
+        norm = np.linalg.norm(arr)
+        arr = arr / norm
+        return arr.tolist()
+
+    def _normalize_list_float(self, vector: List[float]) -> List[float]:
+        arr = np.array(vector)
+        norm = np.linalg.norm(arr)
+        arr = arr / norm
+        return arr.tolist()
+
+    def _load_table(self) -> None:
+        table = Table(
+            self.table_name,
+            self.ob_vector.metadata_obj,
+            autoload_with=self.ob_vector.engine,
+        )
+        column_names = [column.name for column in table.columns]
+        optional_len = len(self.extra_columns or []) + 1
+        assert len(column_names) == (3 + optional_len)
+
+        logging.info(f"load exist table with {column_names} columns")
+        self.primary_field = column_names[0]
+        self.vector_field = column_names[1]
+        self.text_field = column_names[2]
+        self.metadata_field = column_names[3]
 
     def _initialize(self):
         """
@@ -192,11 +162,11 @@ class OceanBaseDB(BaseVectorDB):
 
     def _get_or_create_db(self):
         """Called during initialization"""
-        return self.conn
+        return self.collection
 
 
 
-    def _get_or_create_collection(self, name):
+    def _get_or_create_collection(self, name:Optional[str] = None):
         """
                Get or create a named collection.
 
@@ -208,11 +178,12 @@ class OceanBaseDB(BaseVectorDB):
                """
         if not hasattr(self, "embedder") or not self.embedder:
             raise ValueError("Cannot create a Chroma database collection without an embedder.")
-        self.collection = self.conn
         return self.collection
 
 
-    def get(self, ids: Optional[list[str]] = None, where: Optional[dict[str, any]] = None, limit: Optional[int] = None):
+    def get(self, ids: Optional[list[str]] = None,
+            where: Optional[dict[str, any]] = None,
+            limit: Optional[int] = None):
         """
                 Get existing doc ids present in vector database
 
@@ -225,128 +196,135 @@ class OceanBaseDB(BaseVectorDB):
                 :return: Existing documents.
                 :rtype: list[str]
                 """
-        # Define the table schema
-        chunks_table = Table(
-            self.config.collection_name,
-            Base.metadata,
-            Column("id", VARCHAR(40), primary_key=True),
-            Column("embedding", Vector(self.embedding_dimension)),
-            Column("document", LONGTEXT, nullable=True),
-            Column("metadata", JSON, nullable=True),  # filter
-            keep_existing=True,
+        """Get entities by vector ID.
+
+                Args:
+                    ids (Optional[List[str]]): List of ids to get.
+
+                Returns:
+                    List[Document]: Document results for search.
+                """
+        res = self.ob_vector.get(
+            table_name=self.table_name,
+            ids=ids,
+        )
+        return [
+            Document(
+                page_content=r[0],
+                metadata=json.loads(r[1]),
+            )
+            for r in res.fetchall()
+        ]
+
+    def _create_table_with_index(self, embeddings: list) -> None:
+        try:
+            from pyobvector import VECTOR
+        except ImportError:
+            raise ImportError(
+                "Could not import pyobvector package. "
+                "Please install it with `pip install pyobvector`."
+            )
+
+        if self.collection.check_table_exists(self.table_name):
+            self._load_table()
+            return
+
+        dim = len(embeddings[0])
+        cols = [
+            Column(
+                self.primary_field, String(4096), primary_key=True, autoincrement=False
+            ),
+            Column(self.vector_field, VECTOR(dim)),
+            Column(self.text_field, LONGTEXT),
+            Column(self.metadata_field, JSON),
+        ]
+        if self.extra_columns is not None:
+            cols.extend(self.extra_columns)
+
+        vidx_params = self.ob_vector.prepare_index_params()
+        vidx_params.add_index(
+            field_name=self.vector_field,
+            index_type=OCEAN_BASE_SUPPORTED_VECTOR_INDEX_TYPE,
+            index_name=self.vidx_name,
+            metric_type=self.vidx_metric_type,
+            params=self.vidx_algo_params,
         )
 
-        try:
-            with self.conn.connect() as conn:
-                with conn.begin():
-                    query_condition = chunks_table.c.id.in_(ids)
-                    query_documents = query_condition.get("document")
-                    return query_documents
-        except Exception as e:
-            self.logger.error("Delete operation failed:", str(e))
-            return False
-
-
+        self.ob_vector.create_table_with_index_params(
+            table_name=self.table_name,
+            columns=cols,
+            indexes=None,
+            vidxs=vidx_params,
+            partitions=self.partition,
+        )
 
     def add(
             self,
-            documents: list[str],
-            metadatas: list[object],
-            ids: list[str],
+            add_documents: Optional[list[str]] = None,
+            metadatas: Optional[list[object]] = None,
+            ids: Optional[list[str]]=None,
             **kwargs: Optional[dict[str, any]],
     ) -> Any:
-        embeddings = self.embedder.embedding_fn(documents)
+        embeddings = self.embedding_function(add_documents)
         if len(embeddings) == 0:
             return ids
 
+        total_count = len(embeddings)
+        if total_count == 0:
+            return []
+
+        self._create_table_with_index(embeddings)
+
+        if ids is None:
+            ids = [str(uuid.uuid4()) for _ in add_documents]
+
         if not metadatas:
-            metadatas = [{} for _ in documents]
+            metadatas = [{} for _ in add_documents]
 
-        if self.delay_table_creation and (
-                self.collection_stat is None or self.collection_stat.get_maybe_collection_not_exist()):
-            self.embedding_dimension = len(embeddings[0])
-            self.create_table_if_not_exists()
-            self.delay_table_creation = False
-            if self.collection_stat is not None:
-                self.collection_stat.collection_exists()
+        extra_data = add_documents or [{} for _ in add_documents]
 
-        chunks_table = Table(
-            self.collection_name,
-            Base.metadata,
-            Column("id", VARCHAR(40), primary_key=True),
-            Column("embedding", Vector(self.embedding_dimension)),
-            Column("document", LONGTEXT, nullable=True),
-            Column("metadata", JSON, nullable=True),  # filter
-            keep_existing=True,
-        )
-
-        row_count_query = f"""
-                   SELECT COUNT(*) as count FROM `{self.collection_name}`
-               """
-        chunks_table_data = []
-        # try:
-        with self.engine.connect() as conn:
-            with conn.begin():
-                for document, metadata, chunk_id, embedding in zip(
-                        documents, metadatas, ids, embeddings
-                ):
-                    chunks_table_data.append(
-                        {
-                            "id": chunk_id,
-                            "embedding": embedding,
-                            "document": document,
-                            "metadata": metadata,
-                        }
-                    )
-
-                    # Execute the batch insert when the batch size is reached
-                    if len(chunks_table_data) == self.config.batch_size:
-                        with ob_grwlock.reader_lock():
-                            if self.sql_logger is not None:
-                                insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
-                                self.sql_logger.debug(
-                                    f"""Trying to insert vectors: 
-                                               {insert_sql_for_log}""")
-                            conn.execute(insert(chunks_table).values(chunks_table_data))
-                        # Clear the chunks_table_data list for the next batch
-                        chunks_table_data.clear()
-
-                # Insert any remaining records that didn't make up a full batch
-                if chunks_table_data:
-                    with ob_grwlock.reader_lock():
-                        if self.sql_logger is not None:
-                            insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
-                            self.sql_logger.debug(
-                                f"""Trying to insert vectors: 
-                                           {insert_sql_for_log}""")
-                        conn.execute(insert(chunks_table).values(chunks_table_data))
-
-                # if self.sql_logger is not None:
-                #     self.sql_logger.debug(f"Get the number of vectors: {row_count_query}")
-                if self.enable_index and (
-                        self.collection_stat is None or self.collection_stat.get_maybe_collection_index_not_exist()):
-                    with ob_grwlock.reader_lock():
-                        row_cnt_res = conn.execute(text(row_count_query))
-                    for row in row_cnt_res:
-                        if row.count > self.th_create_ivfflat_index:
-                            self.create_collection_ivfflat_index_if_not_exists()
-                            if self.collection_stat is not None:
-                                self.collection_stat.collection_index_exists()
-
-        # except Exception as e:
-        #     print(f"OceanBase add_text failed: {str(e)}")
-
-        return ids
+        pks: list[str] = []
+        for i in range(0, total_count, self.config.batch_size):
+            data = [
+                {
+                    self.primary_field: index_id,
+                    self.vector_field: (
+                        embedding if not self.normalize else self._normalize_list_float(embedding)
+                    ),
+                    self.text_field: document,
+                    self.metadata_field: metadata,
+                    **extra,
+                }
+                for index_id, embedding, document, metadata, extra in zip(
+                    ids[i: i + self.config.batch_size],
+                    embeddings[i: i + self.config.batch_size],
+                    add_documents[i: i + self.config.batch_size],
+                    metadatas[i: i + self.config.batch_size],
+                    extra_data[i: i + self.config.batch_size],
+                )
+            ]
+            try:
+                self.ob_vector.insert(
+                    table_name=self.table_name,
+                    data=data,
+                )
+                pks.extend(ids[i: i + self.config.batch_size])
+            except Exception:
+                traceback.print_exc()
+                logger.error(
+                    f"Failed to insert batch starting at entity:[{i}, {i + self.config.batch_size})"
+                )
+        return pks
 
 
 
     def query(
             self,
-            input_query: str,
+            input_query: Optional[str] = None,
             n_results: Optional[int] = 4,
-            where: Optional[dict[str, any]] = None,
-            citations: bool = False,
-            **kwargs: Optional[dict[str, Any]],
+            param: Optional[dict] = None,
+            fltr: Optional[str] = None,
+            **kwargs: Any,
     ) -> Union[list[tuple[str, dict]], list[str]]:
         try:
             from sqlalchemy.engine import Row
@@ -357,52 +335,76 @@ class OceanBaseDB(BaseVectorDB):
             )
 
         # filter is not support in OceanBase.
-
-        embedding_str = to_db(self.embedder, self.embedding_dimension)
-        sql_query = f"""
-            SELECT document, metadata, embedding <-> '{embedding_str}' as distance
-            FROM {self.collection_name}
-            ORDER BY embedding <-> '{embedding_str}'
-            LIMIT :n_results
-        """
-        sql_query_str_for_log = f"""
-            SELECT document, metadata, embedding <-> '?' as distance
-            FROM {self.collection_name}
-            ORDER BY embedding <-> '?'
-            LIMIT {n_results}
-        """
-
-        params = {"k": n_results}
-        try:
-            with ob_grwlock.reader_lock():
-                with self.engine.connect() as conn:
-                    if self.sql_logger is not None:
-                        self.sql_logger.debug(f"Trying to do similarity search: {sql_query_str_for_log}")
-                    results: Sequence[Row] = conn.execute(text(sql_query), params).fetchall()
-
-            documents_with_scores = [
-                (
-                    Document(
-                        page_content=result.document,
-                        metadata=json.loads(result.metadata),
-                    ),
-                    result.distance if self.embedder is not None else None,
-                )
-                for result in results
-            ]
-            contexts = []
-            for doc, score in documents_with_scores:
-                context = doc.page_content
-                if citations:
-                    metadata = doc.metadata
-                    metadata["score"] = score
-                    contexts.append(tuple((context, metadata)))
-                else:
-                    contexts.append(context)
-            return contexts
-        except Exception as e:
-            self.logger.error("similarity_search_with_score_by_vector failed:", str(e))
+        if n_results < 0:
             return []
+        if input_query is None:
+            return []
+        query_vector = self.embedder.to_embeddings(input_query)
+        sadf = self.similarity_search_by_vector(
+            embedding=query_vector, k=n_results, param=param, fltr=fltr, **kwargs
+        )
+        return None
+
+    def similarity_search_by_vector(
+        self,
+        embedding: List[float],
+        k: int = 4,
+        param: Optional[dict] = None,
+        fltr: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Perform a similarity search against the query string.
+
+        Args:
+            embedding (List[float]): The embedding vector to search.
+            k (int, optional): How many results to return. Defaults to 10.
+            param (Optional[dict]): The search params for the index type.
+                Defaults to None. Refer to `DEFAULT_OCEAN_BASE_HNSW_SEARCH_PARAM`
+                for example.
+            fltr (Optional[str]): Boolean filter. Defaults to None.
+
+        Returns:
+            List[Document]: Document results for search.
+        """
+        if k < 0:
+            return []
+
+        search_param = (
+            param if param is not None else DEFAULT_OCEAN_BASE_HNSW_SEARCH_PARAM
+        )
+        ef_search = search_param.get(
+            "efSearch", DEFAULT_OCEAN_BASE_HNSW_SEARCH_PARAM["efSearch"]
+        )
+        if ef_search != self.hnsw_ef_search:
+            self.ob_vector.set_ob_hnsw_ef_search(ef_search)
+            self.hnsw_ef_search = ef_search
+
+        res = self.ob_vector.ann_search(
+            table_name=self.table_name,
+            vec_data=(embedding if not self.normalize else self._normalize_list_float(embedding)),
+            vec_column_name=self.vector_field,
+            distance_func=self._parse_metric_type_str_to_dist_func(),
+            topk=k,
+            output_column_names=[self.text_field, self.metadata_field],
+            where_clause=([text(fltr)] if fltr is not None else None),
+            **kwargs,
+        )
+        return [
+            Document(
+                page_content=r[0],
+                metadata=json.loads(r[1]),
+            )
+            for r in res.fetchall()
+        ]
+
+    def _parse_metric_type_str_to_dist_func(self) -> Any:
+        if self.vidx_metric_type == "l2":
+            return func.l2_distance
+        if self.vidx_metric_type == "cosine":
+            return func.cosine_distance
+        if self.vidx_metric_type == "inner_product":
+            return func.negative_inner_product
+        raise ValueError(f"Invalid vector index metric type: {self.vidx_metric_type}")
 
     def count(self) -> int:
         """
@@ -411,17 +413,17 @@ class OceanBaseDB(BaseVectorDB):
         :return: number of documents
         :rtype: int
         """
-        query = {"query": {"match_all": {}}}
-        response = self.client.count(index=self.config.collection_name, body=query)
-        doc_count = response["count"]
-        return doc_count
+        res = self.ob_vector.get(
+            table_name=self.table_name,
+        )
+        return res.rowcount()
 
     def reset(self):
         """
         Resets the database. Deletes all embeddings irreversibly.
         """
         if self.client.indices.exists(index=self.config.collection_name):
-            # delete index in ES
+            # delete index in ocean_base
             self.client.indices.delete(index=self.config.collection_name)
 
     def set_collection_name(self, name: str):
@@ -436,31 +438,20 @@ class OceanBaseDB(BaseVectorDB):
         self.config.collection_name = name
         self._get_or_create_collection(self.config.collection_name)
 
-    def delete(self,ids: Optional[List[str]] = None):
-        if ids is None:
-            raise ValueError("No ids provided to delete.")
+    def delete(  # type: ignore[no-untyped-def]
+            self,
+            ids: Optional[List[str]] = None,
+            where: Optional[str] = None,
+            **kwargs
+    ):
+        """Delete by vector ID or boolean expression.
 
-        # Define the table schema
-        chunks_table = Table(
-            self.config.collection_name,
-            Base.metadata,
-            Column("id", VARCHAR(40), primary_key=True),
-            Column("embedding", Vector(self.embedding_dimension)),
-            Column("document", LONGTEXT, nullable=True),
-            Column("metadata", JSON, nullable=True),  # filter
-            keep_existing=True,
+        Args:
+            ids (Optional[List[str]]): List of ids to delete.
+            where (Optional[str]): Boolean filter that specifies the entities to delete.
+        """
+        self.ob_vector.delete(
+            table_name=self.table_name,
+            ids=ids,
+            where_clause=([text(where)] if where is not None else None),
         )
-
-        try:
-            with self.conn.connect() as conn:
-                with conn.begin():
-                    delete_condition = chunks_table.c.id.in_(ids)
-                    delete_stmt = chunks_table.delete().where(delete_condition)
-                    with ob_grwlock.reader_lock():
-                        if self.sql_logger is not None:
-                            self.sql_logger.debug(f"Trying to delete vectors: {str(delete_stmt)}")
-                        conn.execute(delete_stmt)
-                    return True
-        except Exception as e:
-            self.logger.error("Delete operation failed:", str(e))
-            return False

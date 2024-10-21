@@ -7,18 +7,20 @@ from embedchain import App
 from embedchain.config import AppConfig, BaseEmbedderConfig
 from embedchain.config.vector_db.ocean_base import OceanBaseDBConfig
 from embedchain.embedder.base import BaseEmbedder
+from embedchain.embedder.openai import OpenAIEmbedder
 from embedchain.vectordb.ocean_base import OceanBaseDB
 from unittest.mock import patch
 
-chroma_config = OceanBaseDBConfig(
+ob_config = OceanBaseDBConfig(
             host= '6.14.140.244',
             port= 31200,
             user= 'test@test',
             password= '',
-            database= 'test',
+            db_name= 'test',
             charset= 'utf8mb4',
-            embedder=BaseEmbedder(
-               ## provider="openai",
+            collection_name = 'ocean_base_coll',
+            embedder=OpenAIEmbedder(
+                ##provider="openai",
                 config=BaseEmbedderConfig(
                     model="bailing_1b_embedding",
                     api_key='lKvQac6mTlqFFKRkgfscxxt7UvsR7PbU',
@@ -50,10 +52,14 @@ def cleanup_db():
 
 
 def test_ocean_base_db_duplicates_throw_warning(caplog):
-    db = OceanBaseDB(config=chroma_config)
-    app = App(config=AppConfig(collect_metrics=False), db=db)
-    app.db.collection.add(embeddings=[[0, 0, 0]], ids=["0"])
-    app.db.collection.add(embeddings=[[0, 0, 0]], ids=["0"])
+    db = OceanBaseDB(config=ob_config)
+    app = App(embedding_model = ob_config.embedder,config=AppConfig(collect_metrics=False), db=db)
+
+    app.db.add(add_documents =  ['apple'],
+                       #metadatas = ['apple', 'banana', 'cherry', 'date'],
+                       #ids = ['123','234','345','456'],
+            )
+    #app.add(embeddings=[[0, 0, 0]], ids=["0"])
     assert "Insert of existing embedding ID: 0" in caplog.text
     assert "Add of existing embedding ID: 0" in caplog.text
     app.db.reset()
